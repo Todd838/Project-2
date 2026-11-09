@@ -1,0 +1,231 @@
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAX_CHILDREN 128
+
+union my_semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
+};
+
+static int   ShmID = -1;
+static int   SemID = -1;
+static int  *BankAccount = NULL;      /* shared variable */
+static pid_t children[MAX_CHILDREN];
+static int   nchildren = 0;
+
+/* ---------- semaphore helpers (P = lock, V = unlock) ---------- */
+
+static void sem_lock(void)
+{
+    struct sembuf op = {0, -1, 0};
+    while (semop(SemID, &op, 1) == -1) {
+        if (errno != EINTR) { perror("semop P"); _exit(1); }
+    }
+}
+
+static void sem_unlock(void)
+{
+    struct sembuf op = {0, 1, 0};
+    while (semop(SemID, &op, 1) == -1) {
+        if (errno != EINTR) { perror("semop V"); _exit(1); }
+    }
+}
+
+/* ---------- process setup ---------- */
+
+static void seed_rng(void)
+{
+    srand((unsigned)time(NULL) ^ ((unsigned)getpid() << 16));
+}
+
+static void child_setup(void)
+{
+    /* Children must not run the parent's cleanup handler. */
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    seed_rng();
+}
+
+/* ---------- cleanup (run by parent on SIGINT/SIGTERM) ---------- */
+
+static void cleanup(int sig)
+{
+    (void)sig;
+    for (int i = 0; i < nchildren; i++)
+        kill(children[i], SIGKILL);
+    while (wait(NULL) > 0)
+        ;                              /* reap children */
+    if (BankAccount)
+        shmdt(BankAccount);
+    if (ShmID >= 0)
+        shmctl(ShmID, IPC_RMID, NULL);
+    if (SemID >= 0)
+        semctl(SemID, 0, IPC_RMID);
+    _exit(0);
+}
+
+/* ---------- Dear Old Dad (parent process) ---------- */
+
+static void dear_old_dad(void)
+{
+    int localBalance = 0;             /* non-shared */
+
+    for (;;) {
+        sleep(rand() % 6);            /* 0-5 seconds */
+        printf("Dear Old Dad: Attempting to Check Balance\n");
+
+        if (rand() % 2 == 0) {                        /* even: maybe deposit */
+            if (localBalance < 100) {
+                sem_lock();
+                localBalance = *BankAccount;
+                int amount = rand() % 100 + 1;        /* 1..100 */
+                if (amount % 2 == 0) {
+                    localBalance += amount;
+                    *BankAccount = localBalance;
+                    printf("Dear old Dad: Deposits $%d / Balance = $%d\n",
+                           amount, localBalance);
+                } else {
+                    printf("Dear old Dad: Doesn't have any money to give\n");
+                }
+                sem_unlock();
+            } else {
+                printf("Dear old Dad: Thinks Student has enough Cash ($%d)\n",
+                       localBalance);
+            }
+        } else {                                      /* odd: just check */
+            sem_lock();
+            localBalance = *BankAccount;
+            sem_unlock();
+            printf("Dear Old Dad: Last Checking Balance = $%d\n", localBalance);
+        }
+    }
+}
+
+/* ---------- Lovable Mom (extra credit) ---------- */
+
+static void lovable_mom(void)
+{
+    int localBalance = 0;
+
+    for (;;) {
+        sleep(rand() % 11);           /* 0-10 seconds */
+        printf("Loveable Mom: Attempting to Check Balance\n");
+
+        sem_lock();
+        localBalance = *BankAccount;
+        if (localBalance <= 100) {
+            int amount = rand() % 125 + 1;            /* 1..125 */
+            localBalance += amount;
+            *BankAccount = localBalance;
+            printf("Lovable Mom: Deposits $%d / Balance = $%d\n",
+                   amount, localBalance);
+        }
+        sem_unlock();
+    }
+}
+
+/* ---------- Poor Student (child processes) ---------- */
+
+static void poor_student(void)
+{
+    int localBalance = 0;
+
+    for (;;) {
+        sleep(rand() % 6);            /* 0-5 seconds */
+        printf("Poor Student: Attempting to Check Balance\n");
+
+        if (rand() % 2 == 0) {                        /* even: withdraw */
+            sem_lock();
+            localBalance = *BankAccount;
+            int need = rand() % 50 + 1;               /* 1..50 */
+            printf("Poor Student needs $%d\n", need);
+            if (need <= localBalance) {
+                localBalance -= need;
+                *BankAccount = localBalance;
+                printf("Poor Student: Withdraws $%d / Balance = $%d\n",
+                       need, localBalance);
+            } else {
+                printf("Poor Student: Not Enough Cash ($%d)\n", localBalance);
+            }
+            sem_unlock();
+        } else {                                      /* odd: just check */
+            sem_lock();
+            localBalance = *BankAccount;
+            sem_unlock();
+            printf("Poor Student: Last Checking Balance = $%d\n", localBalance);
+        }
+    }
+}
+
+/* ---------- main ---------- */
+
+static void usage(const char *prog)
+{
+    fprintf(stderr, "Usage: %s <parents: 1=Dad, 2=Dad+Mom> <students>\n", prog);
+    exit(1);
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc != 3)
+        usage(argv[0]);
+
+    int parents  = atoi(argv[1]);
+    int students = atoi(argv[2]);
+    if ((parents != 1 && parents != 2) || students < 1 ||
+        students + parents > MAX_CHILDREN)
+        usage(argv[0]);
+
+    setvbuf(stdout, NULL, _IOLBF, 0); /* one line per write; keeps output tidy */
+
+    signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
+
+    /* Shared memory holding BankAccount */
+    ShmID = shmget(IPC_PRIVATE, sizeof(int), IPC_CREAT | 0666);
+    if (ShmID < 0) { perror("shmget"); return 1; }
+
+    BankAccount = (int *)shmat(ShmID, NULL, 0);
+    if (BankAccount == (void *)-1) { perror("shmat"); cleanup(0); }
+    *BankAccount = 0;
+
+    /* Binary semaphore guarding BankAccount */
+    SemID = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    if (SemID < 0) { perror("semget"); cleanup(0); }
+
+    union my_semun arg;
+    arg.val = 1;
+    if (semctl(SemID, 0, SETVAL, arg) == -1) { perror("semctl"); cleanup(0); }
+
+    /* Lovable Mom */
+    if (parents == 2) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); cleanup(0); }
+        if (pid == 0) { child_setup(); lovable_mom(); _exit(0); }
+        children[nchildren++] = pid;
+    }
+
+    /* Poor Students */
+    for (int i = 0; i < students; i++) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); cleanup(0); }
+        if (pid == 0) { child_setup(); poor_student(); _exit(0); }
+        children[nchildren++] = pid;
+    }
+
+    /* The parent is Dear Old Dad and loops forever until signalled. */
+    seed_rng();
+    dear_old_dad();
+    return 0;
+}
